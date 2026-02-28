@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 
+from adxopt import ADXOpt
+
 # ==============================================================================
 # 🛠️ 全局配置中心 (CONFIG)
 # ==============================================================================
@@ -25,19 +27,21 @@ CONFIG = {
     'D': 8,                  # 隐空间维度
     'hidden_dim': 64,        # 神经网络宽
     'batch_size': 128,       # 批大小
-    'epochs_phase1': 50,     # Phase I 训练轮数
+    'epochs_phase1': 70,    # Phase I 训练轮数
     'lr_phase1': 1e-2,       # 学习率
-    'beta_max': 0.05,        # KL散度权重上限
+    'beta_max': 0.02,        # KL散度权重上限
     
     # --- 3. Phase II: 鲁棒优化 (对抗博弈) ---
     'rho_multiplier': 2.0,   # 攻击半径倍数 
-    
     'adv_steps': 50,         # 内层攻击步数
     'adv_lr': 0.2,           # 攻击步长
     'n_starts': 10,          # 多重启动
-    
-    'outer_steps': 200,      # 外层优化总轮数
-    'outer_lr': 0.1,         # 商家选品策略学习率
+
+    'adx_rounds': 10,         # 外层交替轮数
+    'adx_time_limit': 50.0,  # 每轮 ADXOpt 搜索时间上限 (秒)
+    'adx_b': 2,              # 每个商品允许被移除的最大次数
+    'adx_init_fill': 1.0,    # 外层初始选品向量 (1.0=全选, 0.0=全不选)
+    'phase2_z_init_scale': 0.0,  # 第 1 轮固定 z 的起点幅度
     
     # --- 4. 硬件 ---
     'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -47,7 +51,11 @@ CONFIG = {
 torch.manual_seed(CONFIG['seed'])
 np.random.seed(CONFIG['seed'])
 
-print(f">>> 当前配置: Rho倍数={CONFIG['rho_multiplier']}, 攻击步数={CONFIG['adv_steps']}, 总轮数={CONFIG['outer_steps']}")
+print(
+    f">>> 当前配置: Rho倍数={CONFIG['rho_multiplier']}, "
+    f"攻击步数={CONFIG['adv_steps']}, 交替轮数={CONFIG['adx_rounds']}, "
+    f"ADXOpt时限={CONFIG['adx_time_limit']}s, ADX-B={CONFIG['adx_b']}"
+)
 
 # ==============================================================================
 # PART 1: PHASE I - 数据生成与 VAE 模型
@@ -96,8 +104,10 @@ class DGRA_VAE(nn.Module):
         self.latent_dim = latent_dim
         
         self.enc_net = nn.Sequential(
-            nn.Linear(2 * self.n_plus_1, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU()
+            nn.Linear(2 * self.n_plus_1, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
         )
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
@@ -109,6 +119,7 @@ class DGRA_VAE(nn.Module):
     def forward(self, x):
         h = self.enc_net(x)
         mu, logvar = self.fc_mu(h), self.fc_logvar(h)
+        logvar = torch.clamp(logvar, min=-20.0, max=20.0)
         std = torch.exp(0.5 * logvar)
         z = mu + torch.randn_like(std) * std
         return self.decode(z, mu, logvar)
@@ -116,14 +127,14 @@ class DGRA_VAE(nn.Module):
     def decode(self, z, mu=None, logvar=None):
         h_dec = F.relu(self.dec_hidden(z))
         alpha = F.softmax(self.fc_alpha(h_dec), dim=1)
-        v = torch.exp(self.fc_v(h_dec)).view(-1, self.K, self.n_plus_1)
+        v_logits = torch.clamp(self.fc_v(h_dec), min=-12.0, max=12.0)
+        v = torch.exp(v_logits).view(-1, self.K, self.n_plus_1)
         return alpha, v, mu, logvar
 
     def compute_choice_probs(self, alpha, v, mask):
-        mask_exp = mask.unsqueeze(1) 
-        scores = v * mask_exp 
-        denom = torch.sum(scores, dim=2, keepdim=True) + 1e-9
-        prob_k = scores / denom
+        mask_exp = mask.unsqueeze(1)
+        denom = torch.sum(v * mask_exp, dim=2, keepdim=True) + 1e-9
+        prob_k = (v * mask_exp) / denom
         return torch.sum(alpha.unsqueeze(2) * prob_k, dim=1)
 
 # ==============================================================================
@@ -166,12 +177,16 @@ class RobustAssortmentOptimizer:
 
     def get_revenue(self, x_binary, z_particles):
         alpha, v, _, _ = self.vae.decode(z_particles)
-        mask = x_binary.unsqueeze(1) 
-        scores = v * mask 
-        denom = torch.sum(scores, dim=2, keepdim=True) + 1e-9
-        prob_k = scores / denom
-        prices_exp = self.prices.view(1, 1, -1)
-        rev_k = torch.sum(prob_k * prices_exp, dim=2) 
+        assortment = x_binary[:, 1:]
+        utility = v[:, :, 1:]
+        v0 = v[:, :, :1]
+
+        sol_exp = assortment.unsqueeze(1)
+        denom = v0 + torch.sum(utility * sol_exp, dim=2, keepdim=True) + 1e-9
+        prob_k = (utility * sol_exp) / denom
+
+        prices_exp = self.prices[1:].view(1, 1, -1)
+        rev_k = torch.sum(prob_k * prices_exp, dim=2)
         total_rev = torch.sum(alpha * rev_k, dim=1) 
         return total_rev
 
@@ -199,67 +214,66 @@ class RobustAssortmentOptimizer:
         return z_worst, worst_rev
 
     def optimize_assortment(self):
-        steps = self.cfg['outer_steps']
-        lr = self.cfg['outer_lr']
-        
-        # 【关键修正】：使用 torch.full 创建叶子节点张量
-        pi = torch.full((1, self.N+1), 2.0, device=self.device, requires_grad=True)
-        
-        outer_opt = optim.Adam([pi], lr=lr)
-        STE = StraightThroughEstimator.apply
-        
-        print(f"\n>>> [Phase II] 启动鲁棒选品进化 (Steps={steps}, Rho={self.rho:.2f})...")
-        print(f"{'Step':<5} | {'Robust Rev':<12} | {'Nominal Rev':<12} | {'Action Summary'}")
-        print("-" * 65)
-        
-        best_rev = -1.0
-        best_x = None
-        
-        history_x = [] 
-        z_mean = torch.zeros(1, self.latent_dim, device=self.device)
-        prev_items = set(range(1, self.N+1))
-        
-        for step in range(steps):
-            outer_opt.zero_grad()
-            
-            x_binary = STE(pi)
-            x_fixed = x_binary.clone()
-            x_fixed[:, 0] = 1.0 
-            
-            current_x_np = x_fixed.detach().cpu().numpy().flatten()
-            history_x.append(current_x_np)
-            
-            z_adv, robust_rev = self.solve_inner_adversary(x_fixed)
-            
-            revenue = self.get_revenue(x_fixed, z_adv.detach())
-            loss = -revenue
-            loss.backward()
-            outer_opt.step()
-            
-            if robust_rev > best_rev:
-                best_rev = robust_rev
-                best_x = current_x_np
-            
-            if (step+1) % 10 == 0:
-                with torch.no_grad():
-                    nominal_rev = self.get_revenue(x_fixed, z_mean).item()
-                
-                current_items = set(np.where(current_x_np > 0.5)[0])
-                current_items.discard(0)
-                
-                dropped = prev_items - current_items
-                added = current_items - prev_items
-                
-                change_str = ""
-                if dropped: change_str += f"Drop {len(dropped)} "
-                if added:   change_str += f"Add {len(added)}"
-                if not change_str: change_str = "Stable"
-                
-                items_count = len(current_items)
-                print(f"{step+1:<5} | ${robust_rev:<11.2f} | ${nominal_rev:<11.2f} | Items: {items_count} ({change_str})")
-                prev_items = current_items
+        rounds = self.cfg['adx_rounds']
+        time_limit = self.cfg['adx_time_limit']
+        removal_budget = self.cfg['adx_b']
+        init_fill = self.cfg['adx_init_fill']
+        z_init_scale = self.cfg['phase2_z_init_scale']
 
-        return best_x, best_rev, np.array(history_x)
+        print(
+            f"\n>>> [Phase II] 启动交替对抗搜索 "
+            f"(Rounds={rounds}, ADXOpt TimeLimit={time_limit:.1f}s, Rho={self.rho:.2f})..."
+        )
+
+        z_anchor = torch.full((1, self.latent_dim), z_init_scale, device=self.device)
+        current_real = np.full(self.N, init_fill, dtype=np.float32)
+        history_x = [np.concatenate(([1.0], current_real)).astype(np.float32)]
+        final_robust_rev = None
+
+        for round_idx in range(rounds):
+            z_fixed = z_anchor.detach().clone()
+
+            def nominal_revenue_fn(real_batch):
+                real_batch = np.asarray(real_batch, dtype=np.float32)
+                if real_batch.ndim == 1:
+                    real_batch = np.expand_dims(real_batch, axis=0)
+
+                x_full = np.concatenate(
+                    [np.ones((real_batch.shape[0], 1), dtype=np.float32), real_batch],
+                    axis=1,
+                )
+                x_tensor = torch.from_numpy(x_full).to(self.device)
+                z_batch = z_fixed.repeat(x_tensor.shape[0], 1)
+                with torch.no_grad():
+                    revenues = self.get_revenue(x_tensor, z_batch).cpu().numpy()
+                return revenues.astype(np.float32)
+
+            nominal_best_rev, best_real = ADXOpt(
+                self.N,
+                nominal_revenue_fn,
+                b=removal_budget,
+                S0=current_real,
+                time_limit=time_limit,
+            )
+
+            best_x = np.concatenate(([1.0], best_real), axis=0).astype(np.float32)
+            best_tensor = torch.from_numpy(best_x).to(self.device).unsqueeze(0)
+            z_anchor, final_robust_rev = self.solve_inner_adversary(best_tensor)
+
+            history_x.append(best_x.copy())
+            current_real = best_real.astype(np.float32)
+
+            selected_items = np.where(best_x > 0.5)[0]
+            selected_items = selected_items[selected_items != 0]
+            print(
+                f"    Round {round_idx+1:02d} | "
+                f"Nominal Rev: ${float(nominal_best_rev):.2f} | "
+                f"Robust Rev: ${float(final_robust_rev):.2f} | "
+                f"Items: {len(selected_items)}"
+            )
+
+        final_x = np.concatenate(([1.0], current_real), axis=0).astype(np.float32)
+        return final_x, float(final_robust_rev), np.asarray(history_x, dtype=np.float32)
 
 # ==============================================================================
 # 📊 绘图工具
